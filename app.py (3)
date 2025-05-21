@@ -1,0 +1,302 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uuid
+import requests
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import os
+import pickle
+import re
+import time
+import json
+import uvicorn
+from numpy.linalg import norm
+from typing import List, Tuple, Optional
+from contextlib import suppress
+
+app = FastAPI()
+
+VECTOR_DIR = "vectorstores"
+CHAT_DIR = "chats"
+os.makedirs(VECTOR_DIR, exist_ok=True)
+os.makedirs(CHAT_DIR, exist_ok=True)
+
+MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+DEEPINFRA_API_KEY = "tSpRKL5Nm8c9pt48Z6fcqWXqDZte2xjk"
+DEEPINFRA_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+
+def vec_path(session_id: str) -> str:
+    return os.path.join(VECTOR_DIR, f"{session_id}.index")
+
+def meta_path(session_id: str) -> str:
+    return os.path.join(VECTOR_DIR, f"{session_id}.pkl")
+
+def chat_path(session_id: str) -> str:
+    return os.path.join(CHAT_DIR, f"{session_id}.json")
+
+# For storing last ambiguous question per session
+def ambiguous_path(session_id: str) -> str:
+    return os.path.join(CHAT_DIR, f"{session_id}_ambiguous.txt")
+
+def fetch_url_content(url: str, retries: int = 3, delay: int = 5) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=60)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            return soup.get_text(separator="\n")
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to fetch {url}. Error: {e}")
+
+def split_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    words = text.split()
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size - overlap)]
+
+def vectorize_and_store(session_id: str, text: str):
+    chunks = split_text(text)
+    embeddings = MODEL.encode(chunks)
+    dim = embeddings.shape[1]
+
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(embeddings))
+
+    faiss.write_index(index, vec_path(session_id))
+    with open(meta_path(session_id), "wb") as f:
+        pickle.dump(chunks, f)
+
+    # Initialize chat history and also topic tracking
+    save_chat_history(session_id, [])
+    save_session_topic(session_id, None)  # No topic at start
+    save_ambiguous_question(session_id, None)  # Clear ambiguous question
+
+def load_vectorstore(session_id: str) -> Tuple[Optional[faiss.IndexFlatL2], Optional[List[str]]]:
+    if not os.path.exists(vec_path(session_id)) or not os.path.exists(meta_path(session_id)):
+        return None, None
+    index = faiss.read_index(vec_path(session_id))
+    with open(meta_path(session_id), "rb") as f:
+        chunks = pickle.load(f)
+    return index, chunks
+
+def call_deepinfra(context: str, question: str, history: List[dict], model_context: Optional[str] = None) -> str:
+    if model_context:
+        question += f" (regarding {model_context})"
+
+    # Include full history in prompt
+    history_str = "".join(f"Q: {h['q']}\nA: {h['a']}\n" for h in history)
+
+    prompt = f"""
+Use ONLY the following content to answer the question accurately and concisely. If ambiguous, ask for clarification.
+
+Context:
+{context}
+
+{history_str}
+Question: {question}
+""".strip()
+
+    headers = {
+        "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": DEEPINFRA_MODEL,
+        "messages": [
+            {"role": "system", "content": "You're a precise assistant. Only use the given context. Ask for clarification if needed."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3
+    }
+
+    resp = requests.post("https://api.deepinfra.com/v1/openai/chat/completions", headers=headers, json=payload)
+    if resp.status_code != 200:
+        raise Exception(f"DeepInfra Error {resp.status_code}: {resp.text}")
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+def detect_ambiguity(question: str, context: str, session_id: str) -> Tuple[bool, set]:
+    models = set(m.upper() for m in re.findall(r'\b[A-Z0-9]+-[A-Z0-9]+\b', context))
+    if len(models) > 1 and not any(m.lower() in question.lower() for m in models):
+        return True, models
+    return False, models
+
+def update_model_from_clarification(user_input: str, known_models: set) -> Optional[str]:
+    user_input = user_input.lower()
+    known_map = {m.lower(): m for m in known_models}
+    if user_input in known_map:
+        return known_map[user_input]
+    for model in known_models:
+        # Also allow matching last segment, e.g., "CB" matches "RS485-CB"
+        if model.split("-")[-1].lower() == user_input:
+            return model
+    return None
+
+def cosine_similarity(vec1, vec2) -> float:
+    return np.dot(vec1, vec2) / (norm(vec1) * norm(vec2) + 1e-10)
+
+def get_chat_history(session_id: str) -> List[dict]:
+    with suppress(FileNotFoundError):
+        with open(chat_path(session_id), "r") as f:
+            return json.load(f)
+    return []
+
+def save_chat_history(session_id: str, chat_data: List[dict]):
+    with open(chat_path(session_id), "w") as f:
+        json.dump(chat_data, f, indent=2)
+
+# ---- Save/load last resolved topic/model per session ----
+def get_session_topic(session_id: str) -> Optional[str]:
+    topic_path = os.path.join(CHAT_DIR, f"{session_id}_topic.txt")
+    with suppress(FileNotFoundError):
+        with open(topic_path, "r") as f:
+            return f.read().strip()
+    return None
+
+def save_session_topic(session_id: str, topic: Optional[str]):
+    topic_path = os.path.join(CHAT_DIR, f"{session_id}_topic.txt")
+    if topic is None:
+        # Clear topic if None
+        if os.path.exists(topic_path):
+            os.remove(topic_path)
+    else:
+        with open(topic_path, "w") as f:
+            f.write(topic)
+
+# ---- Save/load last ambiguous question per session ----
+def get_ambiguous_question(session_id: str) -> Optional[str]:
+    path = ambiguous_path(session_id)
+    with suppress(FileNotFoundError):
+        with open(path, "r") as f:
+            return f.read().strip()
+    return None
+
+def save_ambiguous_question(session_id: str, question: Optional[str]):
+    path = ambiguous_path(session_id)
+    if question is None:
+        if os.path.exists(path):
+            os.remove(path)
+    else:
+        with open(path, "w") as f:
+            f.write(question)
+
+class URLPayload(BaseModel):
+    urls: List[str]
+
+class Question(BaseModel):
+    question: str
+    session_id: str
+
+@app.post("/upload_urls")
+def upload_urls(payload: URLPayload):
+    session_id = str(uuid.uuid4())
+    combined_text = ""
+
+    for url in payload.urls:
+        combined_text += fetch_url_content(url) + "\n\n"
+
+    vectorize_and_store(session_id, combined_text)
+    return {"session_id": session_id, "message": "URLs processed and stored."}
+
+@app.post("/chat")
+def chat(query: Question):
+    session_id = query.session_id
+    question = query.question.strip()
+    index, chunks = load_vectorstore(session_id)
+
+    if index is None:
+        raise HTTPException(status_code=400, detail="Invalid session_id. Upload URLs first.")
+
+    history = get_chat_history(session_id)
+    last_topic = get_session_topic(session_id)
+    last_ambiguous_question = get_ambiguous_question(session_id)
+
+    # Case 1: User is clarifying model (e.g. sends "RS485-LB" or "LB") and a previous ambiguous question exists
+    known_models = set(m.upper() for m in re.findall(r'\b[A-Z0-9]+-[A-Z0-9]+\b', "\n\n".join(chunks)))
+    clarified_model = update_model_from_clarification(question, known_models)
+
+    if last_ambiguous_question:
+        # There is a pending ambiguous question, so treat current input as clarification
+        if clarified_model:
+            # Combine clarification with ambiguous question and proceed
+            combined_question = f"{last_ambiguous_question} (regarding {clarified_model})"
+            # Clear ambiguous question because it's resolved
+            save_ambiguous_question(session_id, None)
+            # Save the clarified topic
+            save_session_topic(session_id, clarified_model)
+
+            # Recalculate embeddings and context for combined question
+            query_embedding = MODEL.encode([combined_question])
+            distances, indices = index.search(np.array(query_embedding), k=3)
+            relevant_chunks = [chunks[i] for i in indices[0] if i < len(chunks)]
+            context = "\n\n".join(relevant_chunks)
+
+            answer = call_deepinfra(context, combined_question, history, clarified_model)
+
+            history.append({"q": combined_question, "a": answer})
+            save_chat_history(session_id, history)
+
+            return {"response": answer}
+        else:
+            # The user hasn't clarified model properly yet, ask again
+            return {
+                "response": f"Please specify the model to clarify your question. Known models: {', '.join(sorted(known_models))}"
+            }
+
+    # Case 2: No pending ambiguity, normal question processing
+
+    # If question looks like just a model and no question text, treat as clarification of topic
+    # but no pending ambiguity means treat it as topic switch
+
+    # Detect if user input is only a model identifier and no other question words
+    if question.upper() in known_models or any(question.lower() == m.split("-")[-1].lower() for m in known_models):
+        # This means user changed model/topic explicitly without ambiguity
+        # Reset ambiguous question
+        save_ambiguous_question(session_id, None)
+        # Save topic
+        save_session_topic(session_id, question.upper())
+        return {
+            "response": f"Topic/model changed to {question.upper()}. You can ask questions related to this model now."
+        }
+
+    # Use last topic if available
+    effective_topic = last_topic
+
+    # Prepare embeddings and find relevant chunks
+    query_embedding = MODEL.encode([question])
+    distances, indices = index.search(np.array(query_embedding), k=5)
+    relevant_chunks = [chunks[i] for i in indices[0] if i < len(chunks)]
+    context = "\n\n".join(relevant_chunks)
+
+    # Check ambiguity only if no explicit topic is given
+    ambiguous, models_in_context = detect_ambiguity(question, context, session_id)
+
+    if ambiguous and not effective_topic:
+        # Save ambiguous question for clarification later
+        save_ambiguous_question(session_id, question)
+        return {
+            "response": (
+                f"Your question is ambiguous. Please specify which model you mean from these: {', '.join(sorted(models_in_context))}"
+            )
+        }
+
+    # If no ambiguity or topic is known, answer normally
+    answer = call_deepinfra(context, question, history, effective_topic)
+
+    # Save chat history
+    history.append({"q": question, "a": answer})
+    save_chat_history(session_id, history)
+
+    return {"response": answer}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
