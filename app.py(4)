@@ -1,0 +1,269 @@
+import os
+import re
+import json
+import pickle
+import time
+import requests
+import numpy as np
+import faiss
+import uvicorn
+from bs4 import BeautifulSoup
+from typing import List, Optional, Tuple
+from contextlib import suppress
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+
+app = FastAPI()
+
+VECTOR_DIR = "vectorstores"
+CHAT_DIR = "chats"
+os.makedirs(VECTOR_DIR, exist_ok=True)
+os.makedirs(CHAT_DIR, exist_ok=True)
+
+SESSION_ID = "default"
+URLS_FILE = "urls.txt"
+PROCESSED_LOG = "processed_urls.txt"
+MAX_CONTEXT_CHARS = 8000
+
+MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+
+GROQ_API_KEY = "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"
+GROQ_MODEL = "llama3-70b-8192"
+
+def vec_path():
+    return os.path.join(VECTOR_DIR, "vector.index")
+
+def meta_path():
+    return os.path.join(VECTOR_DIR, "metadata.pkl")
+
+def chat_path():
+    return os.path.join(CHAT_DIR, f"{SESSION_ID}.json")
+
+def clean_text(text: str) -> str:
+    return re.sub(r'\s+', ' ', text).strip()
+
+def extract_device_models(text: str) -> List[str]:
+    # Generic pattern: Uppercase letters + optional digits + dash + suffix
+    pattern = r'\b([A-Z]{2,}\d*(?:-[A-Z0-9]{1,}))\b'
+    return sorted(set(re.findall(pattern, text.upper())))
+
+def extract_models_from_context(context: str) -> dict:
+    """
+    Extract models and group by device prefix.
+    Returns dict: {device_prefix: [model1, model2, ...]}
+    """
+    models = extract_device_models(context)
+    device_models = {}
+    for model in models:
+        prefix = model.split('-')[0]
+        device_models.setdefault(prefix, set()).add(model)
+    return {k: sorted(v) for k, v in device_models.items()}
+
+def find_device_in_question(question: str, devices: list) -> str:
+    question_upper = question.upper()
+    return next((device for device in devices if device in question_upper), "")
+
+def model_mentioned_in_question(question: str, models: list) -> str:
+    question_upper = question.upper()
+    return next((model for model in models if model in question_upper), "")
+
+def save_chat_history(history: List[dict]):
+    with open(chat_path(), "w") as f:
+        json.dump(history, f, indent=2)
+
+def get_chat_history() -> List[dict]:
+    with suppress(FileNotFoundError):
+        with open(chat_path(), "r") as f:
+            return json.load(f)
+    return []
+
+def fetch_url_content(url: str, max_retries=3, timeout=60) -> Optional[str]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(url, timeout=timeout, headers=headers)
+            res.raise_for_status()
+            return BeautifulSoup(res.text, "html.parser").get_text(separator="\n")
+        except Exception as e:
+            print(f"[Retry {attempt+1}] Error fetching {url}: {e}")
+            time.sleep(2)
+    return None
+
+def split_text(text: str, chunk_size=500, overlap=50) -> List[str]:
+    words = text.split()
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size - overlap)]
+
+def vectorize_chunks(chunks: List[str]) -> np.ndarray:
+    return MODEL.encode(chunks)
+
+def load_vectorstore() -> Tuple[Optional[faiss.IndexFlatL2], Optional[List[str]]]:
+    if not os.path.exists(vec_path()) or not os.path.exists(meta_path()):
+        return None, None
+    index = faiss.read_index(vec_path())
+    with open(meta_path(), "rb") as f:
+        chunks = pickle.load(f)
+    return index, chunks
+
+def save_vectorstore(chunks: List[str], vectors: np.ndarray):
+    dim = vectors.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(vectors)
+    faiss.write_index(index, vec_path())
+    with open(meta_path(), "wb") as f:
+        pickle.dump(chunks, f)
+
+def process_urls_from_file():
+    print("⏳ Processing URLs from file...")
+    if not os.path.exists(URLS_FILE):
+        return
+
+    with open(URLS_FILE) as f:
+        urls = [line.strip() for line in f if line.strip()]
+
+    processed = set()
+    if os.path.exists(PROCESSED_LOG):
+        with open(PROCESSED_LOG) as f:
+            processed = set(line.strip() for line in f)
+
+    index, chunks = load_vectorstore()
+    chunks = chunks or []
+    all_vectors = MODEL.encode(chunks) if chunks else np.empty((0, 384))
+
+    new_chunks, new_urls = [], []
+    for url in urls:
+        if url in processed:
+            continue
+        content = fetch_url_content(url)
+        if content:
+            content = clean_text(content)
+            chunked = split_text(content)
+            new_chunks.extend(chunked)
+            new_urls.append(url)
+        else:
+            print(f"⚠️ Failed to process: {url}")
+
+    if new_chunks:
+        new_vectors = vectorize_chunks(new_chunks)
+        all_chunks = chunks + new_chunks
+        all_vectors = np.vstack((all_vectors, new_vectors))
+        save_vectorstore(all_chunks, all_vectors)
+        with open(PROCESSED_LOG, "a") as f:
+            f.write("\n".join(new_urls) + "\n")
+        print(f"✅ Processed {len(new_urls)} new URLs.")
+
+@app.on_event("startup")
+def startup_event():
+    process_urls_from_file()
+
+class Question(BaseModel):
+    question: str
+
+def call_groq(context: str, question: str, history: List[dict]) -> str:
+    messages = [
+        {"role": "system", "content": "You are a precise and factual assistant. ONLY use the provided context to answer. If the answer is not in the context, say 'I couldn't find that in the provided information.'" }
+    ]
+    for entry in history:
+        if "q" in entry and "a" in entry:
+            messages.append({"role": "user", "content": entry["q"]})
+            messages.append({"role": "assistant", "content": entry["a"]})
+    messages.append({"role": "user", "content": f"Context:\n{context}\n\nQ: {question}"})
+
+    # Enforce token limit
+    while sum(len(m["content"]) for m in messages) > MAX_CONTEXT_CHARS and len(messages) > 3:
+        del messages[1:3]
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": 0.3,
+        "top_p": 1.0,
+        "stream": False
+    }
+    response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"GROQ API Error: {response.text}")
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+@app.post("/chat")
+def chat(q: Question):
+    index, chunks = load_vectorstore()
+    if not index or not chunks:
+        raise HTTPException(status_code=500, detail="No vectorstore loaded.")
+
+    embedding = MODEL.encode([q.question])
+    D, I = index.search(np.array(embedding), k=5)
+    context = "\n\n".join(chunks[i] for i in I[0] if i < len(chunks))
+    context = context[:MAX_CONTEXT_CHARS]
+
+    models_map = extract_models_from_context(context)
+    all_models = [model for models in models_map.values() for model in models]
+
+    history = get_chat_history()
+    if not history or "session_memory" not in history[-1]:
+        history.append({"session_memory": {}})
+    session_memory = history[-1]["session_memory"]
+
+    # Check if question explicitly mentions any model
+    model_in_question = model_mentioned_in_question(q.question, all_models)
+
+    # Get devices (prefixes)
+    devices = list(models_map.keys())
+
+    # Find if question mentions any device prefix
+    device_in_question = find_device_in_question(q.question, devices)
+
+    # Ambiguity detection logic:
+    # If multiple distinct models exist in context AND no model is mentioned in question AND no session memory stored
+    if len(all_models) > 1 and not model_in_question:
+        if device_in_question:
+            # Check session memory for this device
+            model_from_memory = session_memory.get(device_in_question)
+            if not model_from_memory:
+                # Ask user for clarification
+                possible_models = models_map.get(device_in_question, [])
+                if possible_models:
+                    return {"response": f"There are multiple models for {device_in_question}. Please specify which model: {', '.join(possible_models)}."}
+            else:
+                model_in_question = model_from_memory
+        else:
+            # No device in question, ask user to specify model globally
+            return {"response": f"There are multiple models available: {', '.join(all_models)}. Please specify which model you mean."}
+
+    # If device mentioned but multiple models for device, pick or ask
+    if device_in_question:
+        models_for_device = models_map.get(device_in_question, [])
+        if len(models_for_device) > 1:
+            model_to_use = model_in_question or session_memory.get(device_in_question)
+            if not model_to_use:
+                return {"response": f"There are multiple models for {device_in_question}. Please specify which model: {', '.join(models_for_device)}."}
+        else:
+            model_to_use = models_for_device[0] if models_for_device else None
+    else:
+        model_to_use = model_in_question or None
+
+    # Update session memory if model identified
+    if model_to_use and device_in_question:
+        session_memory[device_in_question] = model_to_use
+
+    question = q.question
+    if model_to_use and model_to_use not in question.upper():
+        question += f" (Model: {model_to_use})"
+
+    past_turns = [h for h in history if "q" in h and "a" in h]
+    answer = call_groq(context, question, past_turns)
+
+    # Append current Q&A to history and update session memory
+    history[-1]["session_memory"] = session_memory
+    history.append({"q": q.question, "a": answer})
+    save_chat_history(history)
+
+    return {"response": answer.replace('\n', ' ').strip()}
+
+if __name__ == "__main__":
+    
+    uvicorn.run(app, host="127.0.0.1", port=8000)
