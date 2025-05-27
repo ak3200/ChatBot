@@ -1,0 +1,353 @@
+# app.py
+
+import os
+import time
+import json
+import asyncio
+import httpx
+import requests
+import urllib
+import re
+import difflib
+import uvicorn
+from typing import List
+from fastapi import FastAPI, HTTPException, Body
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from dotenv import load_dotenv
+from collections import defaultdict
+import string
+import nltk
+from nltk.corpus import stopwords as nltk_stopwords
+
+# Load environment and nltk
+load_dotenv()
+nltk.download("stopwords")
+
+# Global constants and config
+SESSION_ID = "default"
+CHAT_DIR = "chats"
+CHUNKS_FILE = "chunks.jsonl"
+PROCESSED_PDFS_FILE = "processed_pdfs.txt"
+PROCESSED_URLS_FILE = "processed_urls.txt"
+LAST_AMBIGUOUS_QUESTION_FILE = "last_ambiguous_question.json"
+URLS_FILE = "urls.txt"
+PDF_FOLDER = "pdfs"
+STOPWORDS = set(nltk_stopwords.words("english"))
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+os.makedirs(CHAT_DIR, exist_ok=True)
+
+# Utilities
+def chat_path(session_id=SESSION_ID):
+    return os.path.join(CHAT_DIR, f"{session_id}.json")
+
+def load_processed(path):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def save_processed(path, entries):
+    with open(path, "w") as f:
+        f.write("\n".join(entries))
+
+def append_chunks(chunks):
+    with open(CHUNKS_FILE, "a", encoding="utf-8") as f:
+        for entry in chunks:
+            f.write(json.dumps(entry) + "\n")
+
+def load_all_chunks():
+    if not os.path.exists(CHUNKS_FILE):
+        return []
+    with open(CHUNKS_FILE, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+def extract_text_from_pdf(filepath):
+    reader = PdfReader(filepath)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+def chunk_text(text, chunk_size=500, overlap=50):
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+def embed_and_store_chunks(chunks, source):
+    embeddings = model.encode(chunks)
+    entries = [{"chunk": chunk, "embedding": emb.tolist(), "source": source} for chunk, emb in zip(chunks, embeddings)]
+    append_chunks(entries)
+
+def vector_search(query, all_chunks, top_k=5):
+    if not all_chunks:
+        return []
+    q_embed = model.encode([query])
+    embeddings = [c["embedding"] for c in all_chunks]
+    similarities = cosine_similarity(q_embed, embeddings)[0]
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    return [all_chunks[i] for i in top_indices]
+
+async def fetch_url_text(url, timeout=60, retries=3):
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(url)
+                if "captcha" in response.text.lower():
+                    raise ValueError("Blocked by CAPTCHA")
+                return response.text
+        except Exception:
+            await asyncio.sleep(2 ** attempt)
+    return None
+
+async def process_all_urls():
+    urls = []
+    if os.path.exists(URLS_FILE):
+        with open(URLS_FILE, "r") as f:
+            urls = [line.strip() for line in f if line.strip()]
+    processed = load_processed(PROCESSED_URLS_FILE)
+    new_urls = [url for url in urls if url not in processed]
+    print(f"[INFO] Processing {len(new_urls)} new URLs...")
+
+    tasks = [fetch_url_text(url) for url in new_urls]
+    results = await asyncio.gather(*tasks)
+
+    for url, text in zip(new_urls, results):
+        if text:
+            chunks = chunk_text(text)
+            embed_and_store_chunks(chunks, source=url)
+            processed.add(url)
+
+    save_processed(PROCESSED_URLS_FILE, processed)
+
+def process_all_pdfs():
+    if not os.path.exists(PDF_FOLDER):
+        os.makedirs(PDF_FOLDER)
+    pdfs = [f for f in os.listdir(PDF_FOLDER) if f.endswith(".pdf")]
+    processed = load_processed(PROCESSED_PDFS_FILE)
+    new_pdfs = [f for f in pdfs if f not in processed]
+    print(f"[INFO] Processing {len(new_pdfs)} new PDFs...")
+
+    for f in new_pdfs:
+        path = os.path.join(PDF_FOLDER, f)
+        text = extract_text_from_pdf(path)
+        chunks = chunk_text(text)
+        embed_and_store_chunks(chunks, source=f)
+        processed.add(f)
+
+    save_processed(PROCESSED_PDFS_FILE, processed)
+
+def save_chat(session_id, role, message):
+    path = chat_path(session_id)
+    chat = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            try:
+                chat = json.load(f)
+            except json.JSONDecodeError:
+                chat = []
+    chat.append({"role": role, "message": message})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(chat, f, indent=2)
+
+def call_groq(prompt):
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not found.")
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": "llama3-70b-8192",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 200
+            },
+            timeout=60
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["message"]["content"].strip()
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=response.status_code, detail=f"GROQ API error: {e} - {response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GROQ call failed: {e}")
+
+def extract_device_model_map(chunks):
+    device_to_models = defaultdict(set)
+    pattern = re.compile(r"([A-Z]{2,}[A-Z0-9\-]+)")
+    for entry in chunks:
+        text = entry.get("chunk", "")
+        found = pattern.findall(text.upper())
+        for match in found:
+            parts = match.split("-")
+            if len(parts) >= 2:
+                device = parts[0]
+                model = match
+                device_to_models[device].add(model)
+            else:
+                device = match
+                model = match
+                device_to_models[device].add(model)
+    return {k: sorted(v) for k, v in device_to_models.items()}
+
+def extract_keywords(text):
+    tokens = re.findall(r"\b\w+\b", text.lower())
+    return [t for t in tokens if t not in STOPWORDS and len(t) > 2 and t not in string.punctuation]
+
+def load_model_memory(session_id):
+    path = f"{session_id}_model_memory.json"
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_model_memory(session_id, memory):
+    path = f"{session_id}_model_memory.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(memory, f, indent=2)
+
+def load_last_ambiguous_question(session_id):
+    if os.path.exists(LAST_AMBIGUOUS_QUESTION_FILE):
+        with open(LAST_AMBIGUOUS_QUESTION_FILE, "r") as f:
+            data = json.load(f)
+        return data.get(session_id)
+    return None
+
+def save_last_ambiguous_question(session_id, question):
+    if os.path.exists(LAST_AMBIGUOUS_QUESTION_FILE):
+        with open(LAST_AMBIGUOUS_QUESTION_FILE, "r") as f:
+            data = json.load(f)
+    else:
+        data = {}
+    data[session_id] = question
+    with open(LAST_AMBIGUOUS_QUESTION_FILE, "w") as f:
+        json.dump(data, f)
+
+def fuzzy_match_device_in_text(user_query_lower, devices):
+    matched = set()
+    user_tokens = re.findall(r"\b\w+\b", user_query_lower)
+    for device in devices:
+        device_tokens = device.split()
+        found = True
+        for dt in device_tokens:
+            if not any(difflib.SequenceMatcher(None, dt, ut).ratio() > 0.8 for ut in user_tokens):
+                found = False
+                break
+        if found:
+            matched.add(device)
+    return matched
+
+def model_mentioned(user_query, models):
+    query_upper = user_query.upper()
+    for m in models:
+        if m.upper() in query_upper:
+            return m
+    for m in models:
+        for token in re.findall(r"\b\w+\b", user_query):
+            ratio = difflib.SequenceMatcher(None, m.upper(), token.upper()).ratio()
+            if ratio > 0.8:
+                return m
+    return None
+
+def detect_ambiguous_devices(user_query, device_map):
+    user_query_lower = user_query.lower()
+    matched_devices = fuzzy_match_device_in_text(user_query_lower, device_map.keys())
+    ambiguous_found = {}
+    for device in matched_devices:
+        models = device_map[device]
+        if len(models) > 1:
+            if not model_mentioned(user_query, models):
+                ambiguous_found[device] = models
+    return ambiguous_found
+
+def is_clarification(user_query, device_map):
+    tokens = re.findall(r"\b\w+\b", user_query.strip())
+    if 0 < len(tokens) <= 4:
+        all_models = set(m for models in device_map.values() for m in models)
+        for token in tokens:
+            for m in all_models:
+                if token.upper() == m.upper() or difflib.SequenceMatcher(None, token.upper(), m.upper()).ratio() > 0.8:
+                    return m
+    return None
+
+# FastAPI app
+app = FastAPI(title="Chatbot")
+
+@app.on_event("startup")
+async def startup_event():
+    print("[INFO] Startup: Processing all PDFs and URLs to build knowledge base...")
+    process_all_pdfs()
+    await process_all_urls()
+    print("[INFO] Startup complete.")
+
+@app.post("/chat")
+async def chat(
+    question: str = Body(..., embed=True),
+    session_id: str = Body(SESSION_ID, embed=True)
+):
+    if not question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    question_clean = question.strip()
+    save_chat(session_id, "user", question_clean)
+
+    all_chunks = load_all_chunks()
+    if not all_chunks:
+        return {"answer": "Knowledge base is empty. Please add data first."}
+
+    device_map = extract_device_model_map(all_chunks)
+    model_memory = load_model_memory(session_id)
+    last_ambiguous = load_last_ambiguous_question(session_id)
+
+    clarified_model = is_clarification(question_clean, device_map)
+    if clarified_model and last_ambiguous:
+        clarified_full_model = clarified_model.upper()
+        matched_device = None
+        for dev, models in device_map.items():
+            if clarified_full_model in [m.upper() for m in models]:
+                matched_device = dev
+                break
+        if not matched_device:
+            answer = f"Sorry, model '{clarified_full_model}' not recognized from previous context."
+            save_chat(session_id, "assistant", answer)
+            return {"answer": answer}
+
+        model_memory[matched_device] = clarified_full_model
+        save_model_memory(session_id, model_memory)
+
+        refined_question = f"{last_ambiguous} for model {clarified_full_model}"
+        relevant_chunks = vector_search(refined_question, all_chunks, top_k=5)
+        context_text = "\n---\n".join(chunk["chunk"] for chunk in relevant_chunks)
+        prompt = f"You are a technical assistant with the following context:\n{context_text}\nAnswer precisely the question: {refined_question}"
+        answer = call_groq(prompt)
+        save_chat(session_id, "assistant", answer)
+        save_last_ambiguous_question(session_id, None)
+        return {"answer": answer}
+
+    ambiguous_devices = detect_ambiguous_devices(question_clean, device_map)
+    for device in device_map:
+        if device in question_clean.lower() and device in model_memory:
+            remembered_model = model_memory[device]
+            question_clean += f" for model {remembered_model}"
+
+    if ambiguous_devices:
+        save_last_ambiguous_question(session_id, question_clean)
+        device_list = "\n".join(
+            [f"- {device}: {', '.join(models)}" for device, models in ambiguous_devices.items()]
+        )
+        answer = f"I found multiple models for your device(s). Please specify one of the following:\n{device_list}"
+        save_chat(session_id, "assistant", answer)
+        return {"answer": answer}
+
+    relevant_chunks = vector_search(question_clean, all_chunks, top_k=5)
+    context_text = "\n---\n".join(chunk["chunk"] for chunk in relevant_chunks)
+    prompt = f"You are a technical assistant with the following context:\n{context_text}\nAnswer precisely the question: {question_clean}"
+    answer = call_groq(prompt)
+    save_chat(session_id, "assistant", answer)
+    return {"answer": answer}
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
