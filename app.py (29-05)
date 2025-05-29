@@ -1,0 +1,355 @@
+import os
+import json
+import faiss
+import re
+import time
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI
+from pydantic import BaseModel
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+from groq import Groq
+import threading
+from threading import Lock
+import uvicorn
+import nltk
+from nltk.corpus import stopwords
+
+# Download NLTK stopwords if not already present
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+# Constants
+CHUNKS_FILE = "chunks.jsonl"
+PROCESSED_URLS_FILE = "processed_urls.txt"
+PROCESSED_PDFS_FILE = "processed_pdfs.txt"
+CHAT_HISTORY_FILE = "chat_history.jsonl"
+PDF_DIR = "pdfs"
+URLS_FILE = "urls.txt"
+INDEX_FILE = "faiss_index.bin"
+LLM_MODEL = "llama3-70b-8192"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+REFRESH_INTERVAL = 3600  # 1 hour
+FAILED_URLS_FILE = "failed_urls.txt"
+
+# Init
+model = SentenceTransformer("all-MiniLM-L6-v2")
+embedding_dim = 384
+index = faiss.IndexFlatL2(embedding_dim)
+chunk_texts = []
+chunk_sources = []
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+data_lock = Lock()
+
+app = FastAPI()
+
+# Stopwords: standard English + domain-specific
+stopwords = set(stopwords.words('english'))
+stopwords.update([
+    "command", "commands", "error", "session", "path", "line", "uplink", "address", "http", "at",
+    "instruction", "response", "wmod", "param", "comma", "comman", "m1", "different", "high", "low",
+    "main", "maximum", "least", "regular", "midday", "intervals", "all", "frequency", "specs", "notes",
+    "model", "details", "this", "that", "which", "it", "is", "are", "was", "were", "has", "have", "had",
+    "not", "but", "if", "then", "else", "when", "while", "do", "does", "did", "so", "such", "no", "nor",
+    "too", "very", "can", "will", "just", "should", "would", "could", "may", "might", "must", "shall"
+])
+
+# -------- Utilities --------
+def chunk_text(text, chunk_size=500, overlap=50):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+def save_chunks(chunks, source):
+    try:
+        with open(CHUNKS_FILE, 'a', encoding='utf-8') as f:
+            for chunk in chunks:
+                f.write(json.dumps({"chunk": chunk, "source": source}) + "\n")
+    except PermissionError as e:
+        print(f"[!] Permission denied: {CHUNKS_FILE}: {e}")
+        raise
+
+def embed_and_index_chunks(chunks, source):
+    global chunk_texts, chunk_sources
+    embeddings = model.encode(chunks)
+    with data_lock:
+        print(f"Adding {len(chunks)} embeddings to FAISS index")
+        index.add(np.array(embeddings))
+        chunk_texts.extend(chunks)
+        chunk_sources.extend([source] * len(chunks))
+    save_chunks(chunks, source)
+    save_faiss_index()
+
+def fetch_clean_text_from_url(url):
+    try:
+        res = requests.get(url, timeout=30)
+        soup = BeautifulSoup(res.content, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+        return re.sub(r'\s+', ' ', text)
+    except Exception as e:
+        print(f"[!] Failed to fetch {url}: {e}")
+        with open(FAILED_URLS_FILE, "a") as f:
+            f.write(url + "\n")
+        return ""
+
+def extract_links_from_page(url):
+    try:
+        res = requests.get(url, timeout=30)
+        soup = BeautifulSoup(res.content, "html.parser")
+        return [tag['href'] for tag in soup.find_all("a", href=True) if tag['href'].startswith("http")]
+    except Exception as e:
+        print(f"[!] Failed to extract links from {url}: {e}")
+        return []
+
+def load_processed(file_path):
+    return set(open(file_path).read().splitlines()) if os.path.exists(file_path) else set()
+
+def append_processed(file_path, item):
+    with open(file_path, "a") as f:
+        f.write(item + "\n")
+
+def save_faiss_index():
+    faiss.write_index(index, INDEX_FILE)
+    print(f"Saved FAISS index with {index.ntotal if hasattr(index, 'ntotal') else 'N/A'} embeddings")
+
+def load_faiss_index():
+    if os.path.exists(INDEX_FILE):
+        try:
+            loaded_index = faiss.read_index(INDEX_FILE)
+            print(f"Loaded FAISS index with {loaded_index.ntotal if hasattr(loaded_index, 'ntotal') else 'N/A'} embeddings")
+            return loaded_index
+        except Exception as e:
+            print(f"[!] Failed to load FAISS index: {e}")
+            return None
+    return None
+
+def background_refresh():
+    while True:
+        time.sleep(REFRESH_INTERVAL)
+        print("[*] Background refresh started")
+        process_urls()
+        process_pdfs()
+        save_faiss_index()
+
+def extract_device_model_pairs(chunk_texts, chunk_sources, stopwords):
+    device_models = set()
+    patterns = [
+        r'\b([A-Za-z0-9]+)[\-_ :]([A-Za-z0-9]+)\b',
+        r'\b([A-Za-z0-9]+)\s*\(([A-Za-z0-9]+)\)\b',
+    ]
+    for pattern in patterns:
+        for text in chunk_texts + chunk_sources:
+            matches = re.findall(pattern, text, flags=re.IGNORECASE)
+            for match in matches:
+                device = match[0].strip()
+                model = match[1].strip()
+                if (device.isalnum() and model.isalnum() and
+                    1 <= len(device) <= 10 and 1 <= len(model) <= 10 and
+                    device.lower() not in stopwords and model.lower() not in stopwords):
+                    device_models.add((device, model))
+    return device_models
+
+def get_device_from_question(question, device_model_pairs):
+    devices = {device for device, model in device_model_pairs}
+    for device in devices:
+        pattern = r'\b' + re.escape(device) + r'\b'
+        if re.search(pattern, question, flags=re.IGNORECASE):
+            return device
+    return None
+
+def get_models_for_device(device, device_model_pairs):
+    return sorted([model for dev, model in device_model_pairs if dev.lower() == device.lower()])
+
+def improve_query(session_id, question):
+    history = []
+    if os.path.exists(CHAT_HISTORY_FILE):
+        with open(CHAT_HISTORY_FILE, 'r') as f:
+            for line in f:
+                entry = json.loads(line)
+                if entry['session_id'] == session_id:
+                    history.append(entry['question'])
+    if history:
+        context = " Context: " + " | ".join(history[-3:])
+        return question + context
+    return question
+
+def generate_llm_response(question, context_chunks):
+    context = "\n\n".join([f"{chunk['chunk']}" for chunk in context_chunks])
+    prompt = f"""Answer the user's question based only on the provided context.
+    If the answer is not present in the context, say "I don't know" or "The information is not available."
+    Do not make up answers or guess. Be accurate and concise.
+    Do not mention the source of the information or use phrases like "according to the provided context".
+    Simply state the answer as a fact.
+
+    Context:
+    {context}
+
+    Question: {question}
+
+    Answer:
+    """
+    try:
+        response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=LLM_MODEL,
+            temperature=0.3,
+            max_tokens=512
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Groq API error: {e}")
+        return "I couldn't generate a response at this time."
+
+def save_chat_history(session_id, question, response):
+    with open(CHAT_HISTORY_FILE, "a", encoding='utf-8') as f:
+        f.write(json.dumps({
+            "session_id": session_id,
+            "question": question,
+            "response": response,
+            "timestamp": time.time()
+        }) + "\n")
+
+def load_chunks():
+    global chunk_texts, chunk_sources
+    chunk_texts.clear()
+    chunk_sources.clear()
+    if os.path.exists(CHUNKS_FILE):
+        with open(CHUNKS_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                data = json.loads(line)
+                chunk_texts.append(data['chunk'])
+                chunk_sources.append(data['source'])
+        print(f"[*] Loaded {len(chunk_texts)} chunks from {CHUNKS_FILE}")
+
+def reindex_all_chunks():
+    global index, chunk_texts, chunk_sources
+    if not chunk_texts:
+        return
+    index = faiss.IndexFlatL2(embedding_dim)
+    for i in range(0, len(chunk_texts), 1000):
+        batch = chunk_texts[i:i+1000]
+        embeddings = model.encode(batch)
+        index.add(np.array(embeddings))
+    print(f"Reindexed {len(chunk_texts)} chunks into FAISS index")
+    save_faiss_index()
+
+def process_urls():
+    processed = load_processed(PROCESSED_URLS_FILE)
+    if not os.path.exists(URLS_FILE):
+        print("[!] urls.txt not found")
+        return
+    with open(URLS_FILE) as f:
+        urls = [line.strip() for line in f if line.strip()]
+    print(f"[*] Total URLs in urls.txt: {len(urls)}")
+    print(f"[*] Already processed: {len(processed)}")
+    processed_count = 0
+    for url in urls:
+        if url in processed:
+            continue
+        print(f"[+] Processing URL: {url}")
+        all_links = set([url]) | set(extract_links_from_page(url))
+        for link in all_links:
+            if link in processed:
+                continue
+            text = fetch_clean_text_from_url(link)
+            print(f"Extracted text length: {len(text)}")
+            if text:
+                chunks = chunk_text(text)
+                print(f"Generated chunks: {len(chunks)}")
+                embed_and_index_chunks(chunks, link)
+                append_processed(PROCESSED_URLS_FILE, link)
+                processed_count += 1
+    print(f"[*] Processed {processed_count} new URLs and their links")
+
+def process_pdfs():
+    processed = load_processed(PROCESSED_PDFS_FILE)
+    if not os.path.exists(PDF_DIR):
+        print("[!] PDF directory not found.")
+        return
+    for fname in os.listdir(PDF_DIR):
+        if not fname.endswith(".pdf") or fname in processed:
+            continue
+        path = os.path.join(PDF_DIR, fname)
+        try:
+            reader = PdfReader(path)
+            text = " ".join(page.extract_text() or "" for page in reader.pages)
+            text = re.sub(r'\s+', ' ', text)
+            print(f"[+] Processing PDF: {fname}")
+            print(f"Extracted text length: {len(text)}")
+            chunks = chunk_text(text)
+            print(f"Generated chunks: {len(chunks)}")
+            embed_and_index_chunks(chunks, fname)
+            append_processed(PROCESSED_PDFS_FILE, fname)
+        except Exception as e:
+            print(f"[!] Failed to process {fname}: {e}")
+
+class QueryPayload(BaseModel):
+    question: str
+    session_id: str = "default"
+
+@app.on_event("startup")
+def startup_event():
+    global index
+    loaded_index = load_faiss_index()
+    if loaded_index:
+        index = loaded_index
+        print("[*] Loaded existing FAISS index")
+    else:
+        print("[*] Initializing new FAISS index")
+    load_chunks()
+    if index.ntotal == 0:
+        reindex_all_chunks()
+    print("[*] Loading content from URLs and PDFs...")
+    process_urls()
+    process_pdfs()
+    print("[*] Data loaded.")
+    print(f"Chunk texts after load: {len(chunk_texts)}")
+    print(f"Chunk sources after load: {len(chunk_sources)}")
+    print(f"Index size after load: {index.ntotal if hasattr(index, 'ntotal') else 'N/A'}")
+    refresh_thread = threading.Thread(target=background_refresh, daemon=True)
+    refresh_thread.start()
+
+@app.post("/ask/")
+async def ask_question(payload: QueryPayload):
+    top_k = 5
+    use_llm = True
+
+    # Extract device/model pairs and filter out noise
+    device_model_pairs = extract_device_model_pairs(chunk_texts, chunk_sources, stopwords)
+    
+    # Detect device in question
+    device = get_device_from_question(payload.question, device_model_pairs)
+    if device:
+        models = get_models_for_device(device, device_model_pairs)
+        if len(models) > 1:
+            return f"There are multiple models available for {device}. Please choose a model: {', '.join(models)}"
+        elif len(models) == 1:
+            return f"Did you mean {device} {models[0]}?"
+
+    improved_question = improve_query(payload.session_id, payload.question)
+    query_embedding = model.encode([improved_question])
+    D, I = index.search(np.array(query_embedding), top_k)
+    results = []
+    for i in I[0]:
+        if i >= 0 and i < len(chunk_texts):
+            results.append({
+                "chunk": chunk_texts[i],
+                "source": chunk_sources[i]
+            })
+
+    llm_response = ""
+    if use_llm and results and groq_client:
+        llm_response = generate_llm_response(payload.question, results)
+    save_chat_history(payload.session_id, payload.question, {"matches": results, "llm_response": llm_response})
+    return llm_response
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
